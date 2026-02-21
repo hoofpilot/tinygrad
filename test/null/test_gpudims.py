@@ -19,16 +19,22 @@ class TestGroupedDims(unittest.TestCase):
     self._verify_indices_z3(idxs, dims)
 
   def _verify_indices_z3(self, idxs, dims):
-    """Use z3 to prove 0 <= flat < total for the returned indices.
-    NOTE: no injectivity check — z3 is too slow on nested div/mod expressions (e.g. reverse+split takes ~4s)."""
+    """Use z3 to prove bijectivity: bounds (0 <= flat < total) + injectivity (different inputs => different flat)."""
     total = math.prod(dims)
+    specials = sorted(dedup(flatten([[y for y in x.toposort() if y.op is Ops.SPECIAL] for x in idxs])), key=lambda u: u.arg)
+    # build flat index and primed flat (same expression with renamed SPECIALs)
     flat = UOp.const(dtypes.index, 0)
     for i, idx in enumerate(idxs):
       flat = flat + idx * int(math.prod(dims[i+1:]))
+    flat_p = flat.substitute({s: UOp(Ops.SPECIAL, s.dtype, s.src, s.arg+"_p") for s in specials})
     solver = z3.Solver()
-    [z3_flat] = uops_to_z3(solver, flat)
+    [z3_flat, z3_flat_p] = uops_to_z3(solver, flat, flat_p)
+    # bounds
     self.assertEqual(solver.check(z3_flat < 0), z3.unsat, f"flat can be negative: {dims=}")
     self.assertEqual(solver.check(z3_flat >= total), z3.unsat, f"flat can be >= {total}: {dims=}")
+    # injectivity: flat == flat' but inputs differ => unsat
+    inputs_differ = z3.Or(*[z3.Int(s.arg) != z3.Int(s.arg+"_p") for s in specials])
+    self.assertEqual(solver.check(z3.And(z3_flat == z3_flat_p, inputs_differ)), z3.unsat, f"not injective: {dims=}")
 
   def test_grouped_dims(self):
     # no-op
@@ -45,6 +51,7 @@ class TestGroupedDims(unittest.TestCase):
     self._check_grouped_dims("gidx", (64,3,4), (16,16,16), True, [16,3,16])
     self._check_grouped_dims("gidx", (128,3,4), (16,4,256), False, [16,3,32])
     self._check_grouped_dims("gidx", (4,4,512), (16,4,256), False, [8,4,256])
+    self._check_grouped_dims("gidx", (5,12,7), (8,4,16), False, [10,3,14])
 
     # prefer group_dim strategy when possible
     self._check_grouped_dims("gidx", (512,4,2), (8192,2,2), False, [2048,2])
@@ -59,6 +66,8 @@ class TestGroupedDims(unittest.TestCase):
     self._check_grouped_dims("gidx", (65536,2), (65535,65535,65535), False, [32768,4], False)
     # test when the only divisor is the square root of dim
     self._check_grouped_dims("gidx", (121,), (12,12,12), False, [11,11], False)
+    #                              2             ->             3
+    self._check_grouped_dims("gidx", (128,128), (16,16,256), False, [16,16,64], False)
 
     # collapse on onto the left most axis
     self._check_grouped_dims("gidx", (2,3,4,5), (16,16,16), False, [6,4,5])
@@ -78,11 +87,11 @@ class TestGroupedDims(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       get_grouped_dims("gidx", (2,3,4,5,6), (16,16,16))
 
-  @unittest.expectedFailure
-  def test_split_2d_to_3d_bug(self):
-    # TODO: fix get_grouped_dims a=3,b=2 path: _split_dims redistributes factors across all dims,
-    # but line 51 assumes limited[0]*limited[1]==dims[0]. triggers on WebGPU with 2D shapes > 65535.
-    self._check_grouped_dims("gidx", (128,128), (16,16,256), False, [16,16,64], False)
+  def test_grouped_direct_dims_are_special(self):
+    # when (2,3) are merged into 6, the unmerged dims (4,5) should map directly to SPECIAL ops (no div/mod)
+    idxs = get_grouped_dims("gidx", (2,3,4,5), (16,16,16), False)
+    assert idxs[2].op is Ops.SPECIAL, f"expected SPECIAL for direct-mapped dim, got {idxs[2].op}"
+    assert idxs[3].op is Ops.SPECIAL, f"expected SPECIAL for direct-mapped dim, got {idxs[3].op}"
 
   def test_max_sizes_none(self):
     self._check_grouped_dims("gidx", (2,3,4), None, False, [2,3,4])
